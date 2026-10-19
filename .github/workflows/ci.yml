@@ -3,9 +3,9 @@ name: CI
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, dist]
   pull_request:
-    branches: [main]
+    branches: [main, dist]
 
 permissions:
   contents: read
