@@ -5672,8 +5672,12 @@ def _cohere_rerank_api_key_env(config: Any) -> str:
     explicit = str(getattr(config, "rerank_api_key_env", "") or "").strip()
     if explicit:
         return explicit
+    # embedding_api_key_env defaults to LCM_EMBEDDING_API_KEY even when the
+    # operator never set LCM_EMBEDDING_API_KEY_ENV (Voyage / Ollama / fastembed).
+    # Only reuse that name when the named env var actually holds a key; otherwise
+    # fall through to the dedicated LCM_RERANK_API_KEY last resort.
     embedding_env = str(getattr(config, "embedding_api_key_env", "") or "").strip()
-    if embedding_env:
+    if embedding_env and os.environ.get(embedding_env, "").strip():
         return embedding_env
     return "LCM_RERANK_API_KEY"
 

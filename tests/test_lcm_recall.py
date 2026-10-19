@@ -2010,16 +2010,11 @@ def test_cohere_rerank_missing_model_base_url_and_key_skip(recall_engine, monkey
     config.rerank_api_key_env = ""
     config.embedding_api_key_env = "LCM_EMBEDDING_API_KEY"
     monkeypatch.delenv("LCM_EMBEDDING_API_KEY", raising=False)
-    result, status, _scores = _call_rerank(config, ordered)
-    assert status == "skipped: LCM_EMBEDDING_API_KEY is not set"
-
-    config.embedding_api_key_env = ""
     monkeypatch.delenv("LCM_RERANK_API_KEY", raising=False)
     result, status, _scores = _call_rerank(config, ordered)
     assert status == "skipped: LCM_RERANK_API_KEY is not set"
 
-    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "embed-key")
-    config.embedding_api_key_env = "LCM_EMBEDDING_API_KEY"
+    monkeypatch.setenv("LCM_RERANK_API_KEY", "rerank-only-key")
     constructed = {}
 
     class KeyEnvReranker(_FakeCohereReranker):
@@ -2028,6 +2023,13 @@ def test_cohere_rerank_missing_model_base_url_and_key_skip(recall_engine, monkey
             constructed.update(kwargs)
 
     monkeypatch.setattr(lcm_tools, "CohereCompatibleReranker", KeyEnvReranker)
+    _result, status, _scores = _call_rerank(config, ordered)
+    assert status == "applied"
+    assert constructed["api_key_env"] == "LCM_RERANK_API_KEY"
+
+    monkeypatch.delenv("LCM_RERANK_API_KEY", raising=False)
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "embed-key")
+    constructed.clear()
     _result, status, _scores = _call_rerank(config, ordered)
     assert status == "applied"
     assert constructed["api_key_env"] == "LCM_EMBEDDING_API_KEY"
