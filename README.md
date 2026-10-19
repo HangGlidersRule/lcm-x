@@ -605,6 +605,22 @@ the newest message is never dropped (`0` keeps no fresh tail), and a boundary
 that would begin inside an assistant tool-call/result group is moved back to that
 assistant even when doing so exceeds a configured bound.
 
+### Recall rerank
+
+`lcm_recall` can reorder the top of its fused window with one extra call. The stage is off unless `LCM_RERANK_ENABLED=true`, and it only permutes that window: the reranker's relevance score is never copied onto the RRF score. A transport, deadline, or configuration failure keeps the incoming order. `lcm_grep` does not call it. The stage still runs when embeddings are off, over the full-text hits.
+
+| Variable | Default | Use |
+|----------|---------|-----|
+| `LCM_RERANK_ENABLED` | `false` | Opt in to the `lcm_recall` rerank stage |
+| `LCM_RERANK_PROVIDER` | `voyage` | `voyage` or `cohere-compatible` (case-insensitive). Any other value is `voyage` and logs one warning. `voyage` still requires the embedding provider to be Voyage. `cohere-compatible` calls `LCM_RERANK_BASE_URL` and does not depend on the embedding provider |
+| `LCM_RERANK_MODEL` | `rerank-2.5-lite` | Voyage model when the provider is `voyage` (`rerank-2.5` selects Voyage's quality-oriented model). For `cohere-compatible`, name that endpoint's model explicitly: an empty value or the Voyage default skips the stage |
+| `LCM_RERANK_BASE_URL` | empty | Full invoke URL for `cohere-compatible`, such as `http://host:4000/v1/rerank`. The value is used as given; no path is appended |
+| `LCM_RERANK_API_KEY_ENV` | empty | Name of the env var that holds the bearer token. Empty reuses `LCM_EMBEDDING_API_KEY_ENV` when that is set, otherwise `LCM_RERANK_API_KEY`. Put the token in that env var, not in config |
+| `LCM_RERANK_WINDOW_LIMIT` | `0` | Optional cap on the window. `0` keeps `min(50, limit × 4)` |
+| `LCM_RERANK_MARGIN` | `0.0` | When greater than `0`, the incoming rank-1 hit stays first unless the challenger's relevance clears this gap. `0` reorders unconditionally |
+
+A `cohere-compatible` call sends the query and candidate snippets through the same embedding-privacy transform as a cloud embedding provider. `LCM_EMBEDDING_PRIVACY_ENABLED=false` sends that text raw.
+
 ### Filtering and storage settings
 
 | Variable | Default | Use |
