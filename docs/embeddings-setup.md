@@ -160,6 +160,28 @@ export LCM_EMBEDDING_API_KEY=sk-...        # falls back to SILICONFLOW_API_KEY
 /lcm embed warmup && /lcm embed backfill --apply
 ```
 
+A gateway on the operator's own private network can opt in with
+`LCM_EMBEDDING_ENDPOINT_TRUST=self-hosted`. That relaxes raw-text consent and
+enables automatic chunk embedding. It does not disable the secret-pattern
+transform; `LCM_EMBEDDING_PRIVACY_ENABLED=false` is that opt-out and forces a
+re-embed:
+
+```bash
+export LCM_EMBEDDINGS_ENABLED=true
+export LCM_EMBEDDING_PROVIDER=openai-compatible
+export LCM_EMBEDDING_MODEL=work-bifrost/vllm/qwen3-embedding-8b
+export LCM_EMBEDDING_BASE_URL=http://10.2.10.10:4000/v1
+export LCM_EMBEDDING_ENDPOINT_TRUST=self-hosted
+/lcm embed warmup && /lcm embed backfill --corpus chunks --apply
+```
+
+`self-hosted` is honored only when the host is `localhost` or a literal
+loopback, private, or CGNAT (`100.64.0.0/10`) address, for `openai-compatible`,
+`openai`, `siliconflow`, or `ollama`. A DNS name such as `my-nas.local`, a
+public address, or any other value of the setting is refused with one WARNING
+and behaves as `auto` (chunk apply still needs `--confirm-raw-text`, and new
+raw messages are not embedded automatically).
+
 `LCM_EMBEDDING_BASE_URL` is the API root (a trailing slash is stripped) and
 `/embeddings` is appended. The request body is the standard OpenAI shape —
 `{"model": ..., "input": [...]}` with a `Bearer` authorization header — so any
@@ -210,14 +232,16 @@ is refused until the pass ends, as with two manual runs. There is no new setting
 
 - **Summaries** are embedded with any provider. With a cloud provider this means new summaries
   are sent to it automatically, one bounded batch per pass, without a manual backfill.
-- **Message chunks** are embedded automatically only with fastembed, or with Ollama whose
-  `LCM_OLLAMA_BASE_URL` host is loopback (`localhost`, `127.0.0.0/8`, `::1`). Each pass takes new
+- **Message chunks** are embedded automatically with fastembed, with Ollama whose
+  `LCM_OLLAMA_BASE_URL` host is loopback (`localhost`, `127.0.0.0/8`, `::1`), or when
+  `LCM_EMBEDDING_ENDPOINT_TRUST=self-hosted` is honored for a private-network endpoint.
+  Each pass takes new
   messages first, then older history newest first, one bounded batch at a time, so its cost follows
   new messages, not the store, and an existing store's recent messages are covered before its old
   history; `/lcm embed backfill` embeds the whole backlog in one go. On a cloud provider or a
-  remote Ollama the chunk corpus stays operator-initiated: `--confirm-raw-text` authorizes one invocation and is never
+  remote Ollama that is not an honored self-hosted endpoint, the chunk corpus stays operator-initiated: `--confirm-raw-text` authorizes one invocation and is never
   stored, so run `/lcm embed backfill --corpus chunks --apply --confirm-raw-text` yourself when you
-  want chunk recall.
+  want chunk recall. The trust setting does not disable the secret-pattern transform.
 - If the provider is unavailable (for example fastembed is not installed), the pass is skipped and
   counted; the first skip in a process logs a `WARNING`, later ones log at `DEBUG`.
 
@@ -313,7 +337,12 @@ unless you pass an explicit acknowledgment:
 
 FastEmbed is in-process, so the gate is waived. Ollama is also exempt in the
 current implementation; that is safe only when its configured endpoint is a
-verified trusted local/loopback service (#337). Dry runs (no `--apply`) never
+verified trusted local/loopback service (#337).
+`LCM_EMBEDDING_ENDPOINT_TRUST=self-hosted` also waives the gate, and turns on
+automatic chunk embedding, when the endpoint host is `localhost` or a literal
+loopback, private, or CGNAT address. It does not disable the secret-pattern
+transform. `LCM_EMBEDDING_PRIVACY_ENABLED=false` is the separate opt-out for
+that transform and forces a re-embed under `privacy:off`. Dry runs (no `--apply`) never
 send anything and never require the flag.
 
 > **Provider-input boundary.** Durable history is never retro-redacted. The cloud embedding transform

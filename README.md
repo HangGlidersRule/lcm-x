@@ -614,6 +614,7 @@ assistant even when doing so exceeds a configured bound.
 | `LCM_IGNORE_MESSAGE_PATTERNS` | empty | Comma-separated regex patterns; matching message content is excluded from LCM storage |
 | `LCM_SENSITIVE_PATTERNS_ENABLED` | `false` | Opt in to durable deterministic redaction before LCM storage, FTS indexing, summarization, active replay, and externalized ingest payloads; it does not control cloud embedding privacy |
 | `LCM_EMBEDDING_PRIVACY_ENABLED` | unset (`auto`) | Protect provider-bound copies for known cloud embedding providers without rewriting durable data. Set `false` for an explicit raw-cloud opt-out (`privacy:off` vector revision); local providers remain unchanged |
+| `LCM_EMBEDDING_ENDPOINT_TRUST` | `auto` | `self-hosted` relaxes chunk-corpus raw-text consent and enables automatic chunk embedding for `openai-compatible` / `openai` / `siliconflow` / `ollama` when the endpoint host is `localhost` or a literal loopback, private, or CGNAT address. It does not disable the secret-pattern transform; that opt-out is `LCM_EMBEDDING_PRIVACY_ENABLED=false`, which changes the vector revision and requires a re-embed. Any other value is treated as `auto` |
 | `LCM_SENSITIVE_PATTERNS` | `api_key,bearer_token,password_assignment,private_key` | Comma-separated named sensitive pattern catalog entries to apply when redaction is enabled |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED` | `true` | Store oversized ingest payloads, including tool results, media blocks, and generic raw content, in plugin-managed JSON files |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Externalization threshold for normalized payload text |
@@ -700,6 +701,14 @@ policy change refuses dispatch until `/lcm embed warmup` registers the new ident
 FastEmbed is in-process. The shipped Ollama provider does not apply the cloud
 gate, so use it only with a trusted local/loopback endpoint; #337 tracks
 endpoint-aware locality for remote Ollama configurations.
+
+`LCM_EMBEDDING_ENDPOINT_TRUST=self-hosted` is separate from that transform. It
+relaxes the chunk-corpus raw-text consent gate and enables automatic chunk
+embedding for a private-network endpoint (`localhost`, or a literal loopback,
+private, or CGNAT address) on `openai-compatible`, `openai`, `siliconflow`, or
+`ollama`. It does not disable the secret-pattern transform.
+`LCM_EMBEDDING_PRIVACY_ENABLED=false` remains the opt-out for the transform and
+forces a re-embed under the `privacy:off` revision.
 
 ### Threshold ownership
 
