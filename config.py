@@ -897,8 +897,8 @@ class LCMConfig:
     rerank_provider: str = "voyage"
     # Full invoke URL for a cohere-compatible reranker. Used as-is: no path is appended.
     rerank_base_url: str = ""
-    # Name of the env var holding the bearer token. Empty reuses
-    # ``embedding_api_key_env`` when that is set, otherwise ``LCM_RERANK_API_KEY``.
+    # Name of the env var holding the bearer token. Empty reuses the env var named by
+    # ``embedding_api_key_env`` when that variable holds a value, otherwise ``LCM_RERANK_API_KEY``.
     rerank_api_key_env: str = ""
     embedding_bounded_scan_rows: int = 2_000
     # Vector storage dtype for NEWLY-registered embedding profiles: float32
