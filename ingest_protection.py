@@ -11,6 +11,7 @@ externalized-payload tools.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
+from urllib.parse import urlsplit
 
 from .externalize import (
     externalize_ingest_payload,
@@ -1585,6 +1587,116 @@ def extract_all_externalized_payload_refs(text: str) -> list[str]:
     return refs
 
 
+_ENDPOINT_TRUST_SETTINGS = frozenset({"auto", "self-hosted"})
+_ENDPOINT_TRUST_PROVIDERS = frozenset(
+    {"openai-compatible", "openai", "siliconflow", "ollama"}
+)
+_ENDPOINT_TRUST_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+_ENDPOINT_TRUST_REFUSAL_WARNED = False
+
+
+def _embedding_endpoint_trust_setting(config) -> tuple[str, str | None]:
+    """Return ``(normalized setting, unrecognized reason)``.
+
+    Accepted values are ``auto`` and ``self-hosted`` (case-insensitive, trimmed).
+    Anything else is ``auto`` plus a reason the caller logs once.
+    """
+    raw = getattr(config, "embedding_endpoint_trust", "auto")
+    if raw is None:
+        return "auto", None
+    text = str(raw).strip().lower()
+    if text in _ENDPOINT_TRUST_SETTINGS:
+        return text, None
+    return "auto", f"unrecognized setting {str(raw).strip()!r}; treated as auto"
+
+
+def _embedding_endpoint_provider_id(config) -> str:
+    provider = str(getattr(config, "embedding_provider", "") or "").strip().lower()
+    # resolve_provider accepts ``fast-embed`` for the id ``fastembed``.
+    # It does not accept the underscore form ``openai_compatible``.
+    return {"fast-embed": "fastembed"}.get(provider, provider)
+
+
+def _embedding_endpoint_url(config, provider: str) -> str:
+    if provider == "ollama":
+        # Same defaulting as _automatic_chunks_allowed / resolve_provider.
+        return (
+            str(getattr(config, "ollama_base_url", "http://localhost:11434") or "")
+            .strip()
+            .rstrip("/")
+            or "http://localhost:11434"
+        )
+    return str(getattr(config, "embedding_base_url", "") or "").strip()
+
+
+def _embedding_endpoint_host_status(url: str) -> tuple[bool, str]:
+    if not url:
+        return False, "embedding endpoint URL is empty"
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return False, "embedding endpoint URL is unparsable"
+    if not host:
+        return False, "embedding endpoint URL is unparsable"
+    if host.lower() == "localhost":
+        return True, "localhost"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False, f"hostname {host} is not a literal address"
+    if address.is_loopback:
+        return True, f"{host} is loopback"
+    if address.is_private:
+        return True, f"{host} is private"
+    if address.version == 4 and address in _ENDPOINT_TRUST_CGNAT:
+        return True, f"{host} is in 100.64.0.0/10"
+    return False, f"{host} is a public address"
+
+
+def _warn_endpoint_trust_refusal_once(reason: str) -> None:
+    global _ENDPOINT_TRUST_REFUSAL_WARNED
+    if _ENDPOINT_TRUST_REFUSAL_WARNED:
+        return
+    _ENDPOINT_TRUST_REFUSAL_WARNED = True
+    logger.warning(
+        "LCM_EMBEDDING_ENDPOINT_TRUST refused (%s); behaving as auto",
+        reason,
+    )
+
+
+def embedding_endpoint_trust_status(config) -> tuple[bool, str]:
+    """Return whether a self-hosted embedding endpoint is honored, and why.
+
+    Pure config check: no DNS, sockets, or clock. A honored endpoint relaxes
+    raw-text consent and allows automatic chunk embedding. It does not change
+    the provider-bound privacy transform or revision. A refused ``self-hosted``
+    setting, or any value other than ``auto`` / ``self-hosted``, logs one
+    WARNING per process and is not honored.
+    """
+    setting, invalid = _embedding_endpoint_trust_setting(config)
+    if setting != "self-hosted":
+        if invalid is not None:
+            _warn_endpoint_trust_refusal_once(invalid)
+            return False, invalid
+        return False, "setting is auto"
+    provider = _embedding_endpoint_provider_id(config)
+    if provider == "fastembed":
+        reason = "provider fastembed is already local"
+    elif provider in {"voyage", "voyageai"}:
+        reason = f"provider {provider} is not eligible"
+    elif provider not in _ENDPOINT_TRUST_PROVIDERS:
+        reason = "unknown provider" if not provider else f"unknown provider {provider}"
+    else:
+        honored, reason = _embedding_endpoint_host_status(
+            _embedding_endpoint_url(config, provider)
+        )
+        if not honored:
+            _warn_endpoint_trust_refusal_once(reason)
+        return honored, reason
+    _warn_endpoint_trust_refusal_once(reason)
+    return False, reason
+
+
 def sensitive_pattern_status(config) -> dict[str, Any]:
     """Return metadata-only status for durable and provider-copy protection."""
     configured, active, unknown = _configured_sensitive_pattern_names(config)
@@ -1593,6 +1705,8 @@ def sensitive_pattern_status(config) -> dict[str, Any]:
     privacy_provider = str(getattr(config, "embedding_provider", "") or "")
     privacy_required = embedding_provider_requires_privacy(privacy_provider)
     privacy_enabled = privacy_required and privacy_setting is not False
+    trust_setting, _trust_invalid = _embedding_endpoint_trust_setting(config)
+    trust_honored, trust_reason = embedding_endpoint_trust_status(config)
     return {
         "sensitive_patterns_enabled": enabled,
         "enabled": enabled,
@@ -1613,6 +1727,9 @@ def sensitive_pattern_status(config) -> dict[str, Any]:
         ),
         "placeholder_format": "[LCM sensitive redaction: name=<pattern>; chars=<n>; bytes=<n>; sha256=<16 for non-password>]",
         "lossless_recovery": False if enabled and active else None,
+        "embedding_endpoint_trust": trust_setting,
+        "embedding_endpoint_trust_honored": trust_honored,
+        "embedding_endpoint_trust_reason": trust_reason,
     }
 
 

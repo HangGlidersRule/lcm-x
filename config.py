@@ -590,6 +590,9 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec(
         "embedding_api_key_env", "LCM_EMBEDDING_API_KEY_ENV", str
     ),
+    _EnvFieldSpec(
+        "embedding_endpoint_trust", "LCM_EMBEDDING_ENDPOINT_TRUST", str
+    ),
     _EnvFieldSpec("embedding_query_timeout_s", "LCM_EMBEDDING_QUERY_TIMEOUT_S", float),
     _EnvFieldSpec("recall_query_timeout_s", "LCM_RECALL_QUERY_TIMEOUT_S", float),
     _EnvFieldSpec("embedding_backfill_timeout_s", "LCM_EMBEDDING_BACKFILL_TIMEOUT_S", float),
@@ -782,6 +785,14 @@ class LCMConfig:
     # for local providers. False is an explicit cloud-privacy opt-out whose
     # distinguished revision keeps vector identities posture-bound.
     embedding_privacy_enabled: bool | None = None
+    # Opt-in declaration that the configured embedding endpoint is the operator's
+    # own service. ``auto`` (default) leaves the raw-text consent gate and the
+    # automatic chunk pass unchanged. ``self-hosted`` is honored only for
+    # openai-compatible, openai, siliconflow, and ollama when the endpoint host
+    # is localhost or a literal loopback, private, or CGNAT address; any other
+    # value is treated as ``auto``. This does not disable the secret-pattern
+    # transform (``LCM_EMBEDDING_PRIVACY_ENABLED=false`` is that opt-out).
+    embedding_endpoint_trust: str = "auto"
     # Named catalog entries shared by durable redaction and provider-copy privacy.
     sensitive_patterns: list[str] = field(
         default_factory=lambda: ["api_key", "bearer_token", "password_assignment", "private_key"]

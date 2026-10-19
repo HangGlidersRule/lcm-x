@@ -114,14 +114,16 @@ def test_helper_honors_openai_family_aliases_on_a_private_endpoint(provider):
 
 
 def test_helper_honors_ollama_with_a_private_base_url():
+    # embedding_base_url stays on a public host so the ollama URL is the one judged.
     honored, detail = embedding_endpoint_trust_status(
         _config(
             provider="ollama",
             trust="self-hosted",
-            ollama_base_url="http://10.2.10.10:11434",
+            base_url="https://api.siliconflow.cn/v1",
+            ollama_base_url="http://192.168.1.9:11434",
         )
     )
-    assert (honored, detail) == (True, "10.2.10.10 is private")
+    assert (honored, detail) == (True, "192.168.1.9 is private")
 
 
 @pytest.mark.parametrize(

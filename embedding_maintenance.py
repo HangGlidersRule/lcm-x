@@ -70,6 +70,12 @@ def run_incremental_embedding_pass(db_path: str | Path, config: Any, *, breaker:
 
 
 def _automatic_chunks_allowed(config: Any, command: Any) -> bool:
+    from .ingest_protection import embedding_endpoint_trust_status
+
+    # A honored self-hosted private endpoint is allowed to embed chunks
+    # automatically. FastEmbed and loopback Ollama keep the checks below.
+    if embedding_endpoint_trust_status(config)[0]:
+        return True
     provider = str(getattr(config, "embedding_provider", "") or "").strip().lower()
     # resolve_provider accepts `fast-embed` for the provider whose id is `fastembed`.
     provider = {"fast-embed": "fastembed"}.get(provider, provider)
