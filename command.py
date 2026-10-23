@@ -39,6 +39,7 @@ from .diagnostics import (
 )
 from .ingest_protection import (
     EmbeddingPrivacyPolicyError,
+    embedding_endpoint_trust_status,
     embedding_privacy_revision,
     embedding_provider_requires_privacy,
     externalized_payload_stats,
@@ -5359,7 +5360,7 @@ def _chunk_backfill_run(
     # carry secrets — to the embedding provider. Require an explicit
     # acknowledgment before sending that to a CLOUD provider; local providers
     # (fastembed/ollama) keep the text on this machine and are exempt (F1).
-    if not _is_local_embedding_provider(provider_name) and not confirm_raw_text:
+    if not _is_local_embedding_provider(provider_name) and not embedding_endpoint_trust_status(config)[0] and not confirm_raw_text:
         return _refused(
             f"the chunk corpus derives provider input from RAW, VERBATIM message text — including "
             f"tool-result and error/traceback content that the summary corpus "

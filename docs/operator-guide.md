@@ -424,6 +424,7 @@ Useful environment variables:
 | `LCM_EMBEDDING_PROVIDER` | empty | Embedding provider: `voyage`, `ollama`, `fastembed`, or `openai-compatible` (`openai`/`siliconflow` aliases resolve to that provider identity) |
 | `LCM_EMBEDDING_MODEL` | empty | Provider model identifier registered by `/lcm embed warmup` |
 | `LCM_EMBEDDING_BASE_URL` | empty | Required API root for `openai-compatible`; `/embeddings` is appended after trailing-slash normalization |
+| `LCM_EMBEDDING_ENDPOINT_TRUST` | `auto` | `self-hosted` relaxes chunk-corpus raw-text consent and enables automatic chunk embedding when the provider is `openai-compatible`, `openai`, `siliconflow`, or `ollama` and the endpoint host is `localhost` or a literal loopback, private, or CGNAT (`100.64.0.0/10`) address. A DNS name, a public address, or any other provider is refused (one WARNING) and behavior stays `auto`. This does not disable the secret-pattern transform; `LCM_EMBEDDING_PRIVACY_ENABLED=false` is that opt-out and forces a re-embed |
 | `LCM_EMBEDDING_API_KEY_ENV` | `LCM_EMBEDDING_API_KEY` | Name of the environment variable holding the OpenAI-compatible endpoint key; store the value in an operator secret manager, never in config/docs |
 | `LCM_EMBEDDING_STORAGE_DTYPE` | `float32` | Vector storage dtype for newly-registered embedding profiles: `float32` (byte-identical legacy path) or `int8` (per-vector quantization plus a sign-bit prescreen, a distinct profile identity). See [Vector storage scale options (v3)](#vector-storage-scale-options-v3) |
 | `LCM_EMBEDDING_STORE_DIM` | `0` | Optional Matryoshka truncation dimension for newly-registered profiles (`0` = full profile dim); truncated vectors are renormalized and are also a distinct profile identity |
@@ -669,8 +670,11 @@ The cloud gate applies to provider identity `voyage`/`voyageai` and
 aliases after resolution). An OpenAI-compatible endpoint can be local or
 remote, but the shipped provider identity is conservatively cloud-gated. Set `LCM_EMBEDDING_BASE_URL` and the configured API-key environment name; provider-copy
 privacy resolves ON for that identity exactly as it does for Voyage, and the same nonempty
-known-catalog requirement applies unless you take the explicit `privacy:off` opt-out or a
-future reviewed endpoint-locality contract says otherwise.
+known-catalog requirement applies unless you take the explicit `privacy:off` opt-out.
+`LCM_EMBEDDING_ENDPOINT_TRUST=self-hosted` does not change this transform. It only
+relaxes chunk-corpus raw-text consent and enables automatic chunk embedding for a
+private-network endpoint. `LCM_EMBEDDING_PRIVACY_ENABLED=false` remains the opt-out
+for the secret-pattern transform; that change forces a re-embed.
 
 ### Cache policy boundary
 
@@ -1252,6 +1256,13 @@ possible sensitive fact. When the provider is a cloud provider (e.g. Voyage),
 `--confirm-raw-text`. FastEmbed is in-process and exempt. The shipped Ollama
 provider is also exempt from the cloud gate, so use raw-chunk backfill only with
 a verified trusted local/loopback endpoint; #337 tracks endpoint-aware locality.
+`LCM_EMBEDDING_ENDPOINT_TRUST=self-hosted` relaxes that consent requirement and
+enables automatic chunk embedding when the endpoint host is `localhost` or a
+literal loopback, private, or CGNAT address, for `openai-compatible` (`openai`
+and `siliconflow` included) and Ollama. A DNS hostname or a public address is
+refused and the run still requires `--confirm-raw-text`. The setting does not
+disable the secret-pattern transform. `LCM_EMBEDDING_PRIVACY_ENABLED=false` is
+that opt-out and forces a re-embed.
 Historical source remains unchanged; only provider input is transformed. See
 [embeddings-setup.md](embeddings-setup.md) for the full discussion.
 
