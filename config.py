@@ -103,6 +103,25 @@ def _parse_str_env(key: str, default):
     return os.environ.get(key, default)
 
 
+_RERANK_PROVIDERS = frozenset({"voyage", "cohere-compatible"})
+
+
+def _normalize_rerank_provider(raw: str) -> str:
+    """Accept ``voyage`` and ``cohere-compatible``; anything else is ``voyage``.
+
+    Empty stays ``voyage`` with no warning. An unrecognized value logs one WARNING.
+    """
+    value = str(raw or "").strip().lower()
+    if value in _RERANK_PROVIDERS:
+        return value
+    if value:
+        logger.warning(
+            "invalid env LCM_RERANK_PROVIDER=%r ignored; using voyage",
+            str(raw).strip(),
+        )
+    return "voyage"
+
+
 _HOST_MESSAGE_UID_MODES = ("off", "shadow", "on")
 _host_message_uid_mode_warned = False
 
@@ -562,6 +581,9 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("rerank_model", "LCM_RERANK_MODEL", str),
     _EnvFieldSpec("rerank_window_limit", "LCM_RERANK_WINDOW_LIMIT", int),
     _EnvFieldSpec("rerank_margin", "LCM_RERANK_MARGIN", float),
+    _EnvFieldSpec("rerank_provider", "LCM_RERANK_PROVIDER", str),
+    _EnvFieldSpec("rerank_base_url", "LCM_RERANK_BASE_URL", str),
+    _EnvFieldSpec("rerank_api_key_env", "LCM_RERANK_API_KEY_ENV", str),
     _EnvFieldSpec("recall_scan_rows", "LCM_RECALL_SCAN_ROWS", int),
     _EnvFieldSpec("recall_scan_max_rows", "LCM_RECALL_SCAN_MAX_ROWS", int),
     _EnvFieldSpec("recall_scan_budget_s", "LCM_RECALL_SCAN_BUDGET_S", float),
@@ -880,6 +902,15 @@ class LCMConfig:
     # Optional rank-1 margin gate for the lcm_recall rerank stage. Zero
     # preserves the historical rerank ordering byte-for-byte.
     rerank_margin: float = 0.0
+    # ``voyage`` keeps the embedding-provider gate. ``cohere-compatible`` calls
+    # ``rerank_base_url`` and does not require the embedding provider to be Voyage.
+    # An unrecognized value is stored as ``voyage`` with one WARNING at load.
+    rerank_provider: str = "voyage"
+    # Full invoke URL for a cohere-compatible reranker. Used as-is: no path is appended.
+    rerank_base_url: str = ""
+    # Name of the env var holding the bearer token. Empty reuses the env var named by
+    # ``embedding_api_key_env`` when that variable holds a value, otherwise ``LCM_RERANK_API_KEY``.
+    rerank_api_key_env: str = ""
     embedding_bounded_scan_rows: int = 2_000
     # Vector storage dtype for NEWLY-registered embedding profiles: float32
     # (default; a stock install keeps summary vectors byte-identical) or int8
@@ -1233,6 +1264,10 @@ class LCMConfig:
         if raw_ignore_messages is not None:
             c.ignore_message_patterns = _parse_pattern_list(raw_ignore_messages)
             c.ignore_message_patterns_source = "env"
+
+        c.rerank_provider = _normalize_rerank_provider(c.rerank_provider)
+        c.rerank_base_url = str(c.rerank_base_url or "").strip()
+        c.rerank_api_key_env = str(c.rerank_api_key_env or "").strip()
 
         c.config_sources = config_sources
         c.config_source_warnings = config_source_warnings

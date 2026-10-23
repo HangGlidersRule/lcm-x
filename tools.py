@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -25,6 +26,7 @@ from .externalize import (
     read_externalized_payload_search_prefix,
 )
 from .embedding_provider import (
+    CohereCompatibleReranker,
     VoyageError,
     default_chunk_model,
     probe_provider_availability,
@@ -5658,46 +5660,66 @@ def _lcm_recall_chunk_arm(
     return hits, coverage, knn_results.scanned, knn_results.total
 
 
-def _lcm_recall_rerank(
-    provider: Any,
+_VOYAGE_DEFAULT_RERANK_MODEL = "rerank-2.5-lite"
+
+
+def _rerank_requires_privacy(config: Any, reranker: Any) -> bool:
+    # Issue #1: swap this line when the privacy predicate becomes config-aware.
+    return embedding_provider_requires_privacy("openai-compatible")
+
+
+def _cohere_rerank_api_key_env(config: Any) -> str:
+    explicit = str(getattr(config, "rerank_api_key_env", "") or "").strip()
+    if explicit:
+        return explicit
+    # embedding_api_key_env defaults to LCM_EMBEDDING_API_KEY even when the
+    # operator never set LCM_EMBEDDING_API_KEY_ENV (Voyage / Ollama / fastembed).
+    # Only reuse that name when the named env var actually holds a key; otherwise
+    # fall through to the dedicated LCM_RERANK_API_KEY last resort.
+    embedding_env = str(getattr(config, "embedding_api_key_env", "") or "").strip()
+    if embedding_env and os.environ.get(embedding_env, "").strip():
+        return embedding_env
+    return "LCM_RERANK_API_KEY"
+
+
+def _cohere_rerank_skip_reason(config: Any) -> str | None:
+    if not str(getattr(config, "rerank_base_url", "") or "").strip():
+        return "skipped: LCM_RERANK_BASE_URL is required for cohere-compatible"
+    model = str(getattr(config, "rerank_model", "") or "").strip()
+    if not model or model == _VOYAGE_DEFAULT_RERANK_MODEL:
+        return "skipped: LCM_RERANK_MODEL is required for cohere-compatible"
+    key_env = _cohere_rerank_api_key_env(config)
+    if not os.environ.get(key_env, "").strip():
+        return f"skipped: {key_env} is not set"
+    return None
+
+
+def _normalized_rerank_provider(config: Any) -> str:
+    value = str(getattr(config, "rerank_provider", "") or "voyage").strip().lower()
+    if value == "cohere-compatible":
+        return value
+    return "voyage"
+
+
+def _lcm_recall_rerank_apply(
+    reranker: Any,
     query: str,
     ordered: list[dict[str, Any]],
     *,
     window: int,
     deadline: float,
     config: Any,
+    model: str,
+    requires_privacy: bool,
 ) -> tuple[list[dict[str, Any]], str, list[list[Any]]]:
-    """Optionally REORDER the top ``window`` fused candidates in ONE API call.
-
-    Default OFF. This is a pure rank-reorder WITHIN the window: the reranker's
-    relevance scores decide the intra-window order but are never spliced onto the
-    ``rrf_score``/``_final_score`` scale (the two live on incompatible scales, so a
-    ~0-1 voyage score would otherwise dominate the ~0.05-max RRF score). Entries
-    outside the window keep their incoming (post scope/recency prior) order.
-
-    ``ordered`` MUST already carry the scope/recency prior so the window reflects
-    the true top-N rather than the raw RRF order (RERANK-1). Any failure (no
-    provider, non-voyage, network, deadline) skips silently back to the incoming
-    order with a ``skipped: <reason>`` status. Privacy-policy failures remain
-    loud, matching the cloud query-embedding path.
-    """
-    if not bool(getattr(config, "rerank_enabled", False)):
-        return ordered, "disabled", []
-    if (
-        provider is None
-        or getattr(provider, "provider_id", "") != "voyage"
-        or not hasattr(provider, "rerank")
-    ):
-        return ordered, "skipped: rerank requires the voyage provider", []
+    """Shared window, privacy, deadline, and margin stages for one reranker."""
     head = ordered[:window]
     if not head:
         return ordered, "skipped: no candidates to rerank", []
     outbound_query = str(query)
     documents = [str(entry["hit"].get("snippet") or "") for entry in head]
     privacy_revision: str | None = None
-    if embedding_provider_requires_privacy(
-        str(getattr(provider, "provider_id", "") or "")
-    ):
+    if requires_privacy:
         outbound_query, privacy_revision, _changed = protect_embedding_text(
             outbound_query, config
         )
@@ -5715,15 +5737,12 @@ def _lcm_recall_rerank(
                 config,
                 expected_revision=privacy_revision,
             )
-        return provider.rerank(
+        return reranker.rerank(
             outbound_query,
             documents,
             top_k=len(documents),
             timeout=max(0.001, deadline - time.monotonic()),
-            model=(
-                str(getattr(config, "rerank_model", "") or "").strip()
-                or "rerank-2.5-lite"
-            ),
+            model=model,
         )
 
     try:
@@ -5813,6 +5832,77 @@ def _lcm_recall_rerank(
             reordered.append(entry)
     reordered.extend(ordered[window:])
     return reordered, "applied", rerank_scores
+
+
+def _lcm_recall_rerank(
+    provider: Any,
+    query: str,
+    ordered: list[dict[str, Any]],
+    *,
+    window: int,
+    deadline: float,
+    config: Any,
+) -> tuple[list[dict[str, Any]], str, list[list[Any]]]:
+    """Optionally REORDER the top ``window`` fused candidates in ONE API call.
+
+    Default OFF. This is a pure rank-reorder WITHIN the window: the reranker's
+    relevance scores decide the intra-window order but are never spliced onto the
+    ``rrf_score``/``_final_score`` scale (the two live on incompatible scales, so a
+    ~0-1 voyage score would otherwise dominate the ~0.05-max RRF score). Entries
+    outside the window keep their incoming (post scope/recency prior) order.
+
+    ``ordered`` MUST already carry the scope/recency prior so the window reflects
+    the true top-N rather than the raw RRF order (RERANK-1). ``rerank_provider=voyage``
+    (the default) keeps the Voyage embedding-provider gate and its status strings.
+    ``cohere-compatible`` uses its own endpoint and ignores which embedding provider
+    is configured. Any failure (no provider, non-voyage, missing cohere settings,
+    network, deadline) skips silently back to the incoming order with a
+    ``skipped: <reason>`` status. Privacy-policy failures remain loud, matching
+    the cloud query-embedding path.
+    """
+    if not bool(getattr(config, "rerank_enabled", False)):
+        return ordered, "disabled", []
+    if _normalized_rerank_provider(config) == "cohere-compatible":
+        reason = _cohere_rerank_skip_reason(config)
+        if reason is not None:
+            return ordered, reason, []
+        model = str(getattr(config, "rerank_model", "") or "").strip()
+        reranker = CohereCompatibleReranker(
+            base_url=str(getattr(config, "rerank_base_url", "") or "").strip(),
+            api_key_env=_cohere_rerank_api_key_env(config),
+            model=model,
+        )
+        return _lcm_recall_rerank_apply(
+            reranker,
+            query,
+            ordered,
+            window=window,
+            deadline=deadline,
+            config=config,
+            model=model,
+            requires_privacy=_rerank_requires_privacy(config, reranker),
+        )
+    if (
+        provider is None
+        or getattr(provider, "provider_id", "") != "voyage"
+        or not hasattr(provider, "rerank")
+    ):
+        return ordered, "skipped: rerank requires the voyage provider", []
+    return _lcm_recall_rerank_apply(
+        provider,
+        query,
+        ordered,
+        window=window,
+        deadline=deadline,
+        config=config,
+        model=(
+            str(getattr(config, "rerank_model", "") or "").strip()
+            or _VOYAGE_DEFAULT_RERANK_MODEL
+        ),
+        requires_privacy=embedding_provider_requires_privacy(
+            str(getattr(provider, "provider_id", "") or "")
+        ),
+    )
 
 
 def _lcm_recall_fts_anchor(

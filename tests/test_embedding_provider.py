@@ -1357,6 +1357,142 @@ def test_voyage_rerank_empty_documents_short_circuits(monkeypatch):
     assert transport.calls == []
 
 
+_COHERE_RERANK_URL = "http://10.2.10.10:4000/v1/rerank"
+_COHERE_RERANK_MODEL = "work-bifrost/vllm/qwen3-reranker-4b"
+
+
+def _cohere_rerank_response(rows) -> HttpResponse:
+    """rows: iterable of (index, relevance_score) in the Cohere ``results`` shape."""
+    return _response(
+        200,
+        {
+            "id": "rerank-test",
+            "model": _COHERE_RERANK_MODEL,
+            "results": [
+                {"index": index, "relevance_score": score} for index, score in rows
+            ],
+            "usage": {"total_tokens": 3},
+        },
+    )
+
+
+def _cohere_reranker(transport, *, api_key_env="OPENAI_API_KEY"):
+    from hermes_lcm.embedding_provider import CohereCompatibleReranker
+
+    return CohereCompatibleReranker(
+        base_url=_COHERE_RERANK_URL,
+        api_key_env=api_key_env,
+        model=_COHERE_RERANK_MODEL,
+        transport=transport,
+    )
+
+
+def test_cohere_compatible_rerank_posts_exact_request_and_parses_results(monkeypatch):
+    """Full invoke URL, bearer header, and Cohere ``results`` body. ``top_n`` is
+    the document count; ``top_k`` is not sent."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    transport = FakeTransport(
+        _cohere_rerank_response([(0, 0.10), (2, 0.50), (1, 0.90)])
+    )
+    reranker = _cohere_reranker(transport)
+
+    ranked = reranker.rerank(
+        "where is the kanban",
+        ["a", "b", "c"],
+        top_k=1,
+        timeout=5.0,
+        model=_COHERE_RERANK_MODEL,
+    )
+
+    assert reranker.provider_id == "cohere-compatible"
+    assert ranked == [(1, 0.90), (2, 0.50), (0, 0.10)]
+    assert len(transport.calls) == 1
+    call = transport.calls[0]
+    assert call["url"] == _COHERE_RERANK_URL
+    assert call["headers"]["Authorization"] == "Bearer test-key"
+    assert call["headers"]["Content-Type"] == "application/json"
+    assert call["payload"] == {
+        "model": _COHERE_RERANK_MODEL,
+        "query": "where is the kanban",
+        "documents": ["a", "b", "c"],
+        "top_n": 3,
+    }
+    assert "top_k" not in call["payload"]
+    assert call["timeout"] == 5.0
+
+
+def test_cohere_compatible_rerank_drops_out_of_range_index(monkeypatch):
+    """Index -1 and index == len(documents) are dropped, not returned."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    transport = FakeTransport(
+        _cohere_rerank_response([(-1, 0.99), (0, 0.40), (2, 0.20), (1, 0.80)])
+    )
+    reranker = _cohere_reranker(transport)
+
+    ranked = reranker.rerank(
+        "q", ["a", "b"], timeout=5.0, model=_COHERE_RERANK_MODEL
+    )
+
+    assert ranked == [(1, 0.80), (0, 0.40)]
+
+
+def test_cohere_compatible_rerank_non_2xx_raises_without_auth_body(monkeypatch):
+    """Non-2xx raises. Auth failures do not include the response body."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    secret = "auth-body-must-not-leak"
+    transport = FakeTransport(_response(401, {"error": secret}))
+    reranker = _cohere_reranker(transport)
+
+    with pytest.raises(EmbeddingProviderError, match="401") as caught:
+        reranker.rerank("q", ["a", "b"], timeout=5.0, model=_COHERE_RERANK_MODEL)
+    assert secret not in str(caught.value)
+
+    transport = FakeTransport(_response(500, {"error": "boom"}))
+    reranker = _cohere_reranker(transport)
+    with pytest.raises(EmbeddingProviderError, match="500"):
+        reranker.rerank("q", ["a"], timeout=5.0, model=_COHERE_RERANK_MODEL)
+
+
+def test_cohere_compatible_rerank_missing_api_key_raises(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    transport = FakeTransport()
+    reranker = _cohere_reranker(transport)
+
+    with pytest.raises(EmbeddingProviderError, match="OPENAI_API_KEY is not set"):
+        reranker.rerank("q", ["a"], timeout=5.0, model=_COHERE_RERANK_MODEL)
+
+    assert transport.calls == []
+
+
+def test_cohere_compatible_rerank_empty_documents_short_circuits(monkeypatch):
+    """No documents => [] with no transport call and no key lookup."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    transport = FakeTransport()
+    reranker = _cohere_reranker(transport)
+
+    assert reranker.rerank("q", [], timeout=5.0, model=_COHERE_RERANK_MODEL) == []
+    assert transport.calls == []
+
+
+def test_cohere_compatible_rerank_deadline_exceeded_raises(monkeypatch):
+    """One absolute deadline: a transport that consumes the budget raises, once."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(provider_mod.time, "monotonic", lambda: clock["now"])
+    calls = []
+
+    def transport(**kwargs):
+        calls.append(kwargs)
+        clock["now"] = 1010.0
+        return _cohere_rerank_response([(0, 1.0)])
+
+    reranker = _cohere_reranker(transport)
+    with pytest.raises(EmbeddingProviderError, match="deadline exceeded"):
+        reranker.rerank("q", ["a"], timeout=1.0, model=_COHERE_RERANK_MODEL)
+
+    assert len(calls) == 1
+
+
 def _openai_compatible_success(count: int, dim: int = 3) -> HttpResponse:
     return _response(
         200,

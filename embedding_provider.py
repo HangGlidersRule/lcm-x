@@ -1345,6 +1345,118 @@ class VoyageProvider(_ResilientProvider):
         )
 
 
+class CohereCompatibleReranker:
+    """One-shot rerank client for a Cohere-compatible ``/rerank`` endpoint.
+
+    The invoke URL is the full URL the operator configured. Nothing is appended.
+    ``rerank`` shares Voyage's contract: one absolute deadline, no retries past
+    it, out-of-range indexes dropped, and pairs ordered by descending relevance.
+    """
+
+    provider_id = "cohere-compatible"
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key_env: str,
+        model: str,
+        transport: HttpTransport | None = None,
+    ) -> None:
+        self.base_url = str(base_url or "").strip()
+        self.api_key_env = str(api_key_env or "").strip() or "LCM_RERANK_API_KEY"
+        self.model = str(model or "").strip()
+        self._transport = transport or _default_http_transport
+
+    def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        top_k: int | None = None,
+        timeout: float,
+        model: str,
+    ) -> list[tuple[int, float]]:
+        """Cross-encoder rerank under a single absolute ``timeout`` budget.
+
+        ``top_k`` is accepted so callers can share the Voyage signature. The
+        payload always asks for every document via ``top_n``.
+        """
+        del top_k  # payload uses top_n=len(documents); see the class contract
+        docs = [str(document) for document in documents]
+        if not docs:
+            return []
+        budget = max(0.001, float(timeout))
+        deadline = time.monotonic() + budget
+        if not self.base_url:
+            raise EmbeddingProviderError(
+                "LCM_RERANK_BASE_URL is required for cohere-compatible"
+            )
+        api_key = os.environ.get(self.api_key_env, "").strip()
+        if not api_key:
+            raise EmbeddingProviderError(f"{self.api_key_env} is not set")
+        response = self._transport(
+            url=self.base_url,
+            payload={
+                "model": str(model),
+                "query": str(query),
+                "documents": docs,
+                "top_n": len(docs),
+            },
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=budget,
+        )
+        if not (200 <= response.status < 300):
+            status = response.status
+            # Auth bodies can echo the bearer material; keep them out of the
+            # exception, matching Voyage rerank.
+            logged_body = (
+                "[SKIPPED: auth response body]"
+                if status in {401, 403}
+                else _scrub_response_body(response.body)
+            )
+            logger.warning(
+                "cohere-compatible rerank error status=%s body=%s",
+                status,
+                logged_body,
+            )
+            raise EmbeddingProviderError(
+                f"cohere-compatible rerank request failed ({status})"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise EmbeddingProviderError(
+                "cohere-compatible rerank deadline exceeded"
+            )
+
+        def parse() -> list[tuple[int, float]]:
+            data = _response_json(response, provider="cohere-compatible rerank")
+            rows = data.get("results")
+            if not isinstance(rows, list):
+                raise EmbeddingProviderError(
+                    "cohere-compatible rerank response did not contain result data"
+                )
+            ranked: list[tuple[int, float]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                index = int(row.get("index", -1))
+                if not 0 <= index < len(docs):
+                    continue
+                ranked.append((index, float(row.get("relevance_score", 0.0))))
+            ranked.sort(key=lambda item: (-item[1], item[0]))
+            return ranked
+
+        return _run_blocking_with_deadline(
+            parse,
+            timeout=remaining,
+            provider="cohere-compatible rerank response processing",
+        )
+
+
 class OllamaProvider(_ResilientProvider):
     provider_id = "ollama"
 

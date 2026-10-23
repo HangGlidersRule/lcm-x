@@ -1686,6 +1686,418 @@ def test_rerank_failure_falls_back_to_rrf_order(recall_engine, monkeypatch):
     assert payload["hits"][0]["node_id"] == a  # RRF order intact
 
 
+def _rerank_window_entry(snippet: str, session_id: str, *, score: float = 0.016) -> dict:
+    return {
+        "hit": {
+            "kind": "summary",
+            "snippet": snippet,
+            "session_id": session_id,
+        },
+        "rrf_score": score,
+    }
+
+
+def _enable_cohere_rerank(
+    config,
+    monkeypatch,
+    *,
+    model="work-bifrost/vllm/qwen3-reranker-4b",
+    base_url="http://10.2.10.10:4000/v1/rerank",
+    key_env="OPENAI_API_KEY",
+    key="test-key",
+):
+    config.rerank_enabled = True
+    config.rerank_provider = "cohere-compatible"
+    config.rerank_model = model
+    config.rerank_base_url = base_url
+    config.rerank_api_key_env = key_env
+    if key is None:
+        monkeypatch.delenv(key_env, raising=False)
+    else:
+        monkeypatch.setenv(key_env, key)
+
+
+class _FakeCohereReranker:
+    """Records the outbound copy and returns last-document-first, like the Voyage tests."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.calls = []
+
+    def rerank(self, query, documents, *, top_k=None, timeout, model):
+        self.calls.append(
+            {
+                "query": query,
+                "documents": list(documents),
+                "top_k": top_k,
+                "timeout": timeout,
+                "model": model,
+            }
+        )
+        return sorted(
+            ((index, float(index)) for index in range(len(documents))),
+            key=lambda item: -item[1],
+        )
+
+
+def _call_rerank(config, ordered, provider=None, *, window=5):
+    return lcm_tools._lcm_recall_rerank(
+        provider,
+        "kanban",
+        ordered,
+        window=window,
+        deadline=time.monotonic() + 30.0,
+        config=config,
+    )
+
+
+def test_default_rerank_provider_still_requires_voyage(recall_engine):
+    """Unset LCM_RERANK_PROVIDER keeps the Voyage gate and its status string."""
+    recall_engine._config.rerank_enabled = True
+    ordered = [_rerank_window_entry("kanban alpha", "session-a")]
+    provider = SimpleNamespace(provider_id="openai-compatible")
+
+    result, status, scores = _call_rerank(recall_engine._config, ordered, provider)
+
+    assert result == ordered
+    assert status == "skipped: rerank requires the voyage provider"
+    assert scores == []
+
+
+def test_cohere_rerank_reorders_window_and_keeps_tail(recall_engine, monkeypatch):
+    _enable_cohere_rerank(recall_engine._config, monkeypatch)
+    ordered = [
+        _rerank_window_entry("kanban alpha", "session-a"),
+        _rerank_window_entry("kanban beta", "session-b"),
+        _rerank_window_entry("kanban tail", "session-c"),
+    ]
+    monkeypatch.setattr(lcm_tools, "CohereCompatibleReranker", _FakeCohereReranker)
+    provider = SimpleNamespace(provider_id="openai-compatible")
+
+    result, status, scores = _call_rerank(
+        recall_engine._config, ordered, provider, window=2
+    )
+
+    assert status == "applied"
+    assert [entry["hit"]["session_id"] for entry in result] == [
+        "session-b",
+        "session-a",
+        "session-c",
+    ]
+    assert [entry["rrf_score"] for entry in result] == [0.016, 0.016, 0.016]
+    assert scores == [
+        [1, "session-b", 1.0],
+        [0, "session-a", 0.0],
+    ]
+
+
+def test_cohere_rerank_protects_cloud_payload_and_reorders_original_hits(
+    recall_engine, monkeypatch
+):
+    """Same outbound redaction and original-hit reorder as the Voyage path, while
+    the embedding provider is openai-compatible and has no rerank method."""
+    _enable_cohere_rerank(recall_engine._config, monkeypatch)
+    query_secret = "query-secret-abcdefghijklmnop"
+    alpha_secret = "alpha-secret-abcdefghijklmnop"
+    beta_secret = "beta-secret-abcdefghijklmnop"
+    a = _add_summary(
+        recall_engine,
+        f"kanban alpha api_key={alpha_secret}",
+        session_id="session-a",
+        created_at=5.0,
+    )
+    b = _add_summary(
+        recall_engine,
+        f"kanban beta api_key={beta_secret}",
+        session_id="session-b",
+        created_at=5.0,
+    )
+    _seed_summary_vectors(
+        recall_engine,
+        [(a, [1.0, 0.0]), (b, [0.95, 0.312])],
+        provider="openai-compatible",
+    )
+
+    class EmbeddingProvider(MockProvider):
+        provider_id = "openai-compatible"
+
+    rerankers = []
+
+    class RecordingReranker(_FakeCohereReranker):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            rerankers.append(self)
+
+    monkeypatch.setattr(lcm_tools, "CohereCompatibleReranker", RecordingReranker)
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        provider=EmbeddingProvider(),
+        query=f"kanban api_key={query_secret}",
+        include="summaries",
+        scope_bias=0.0,
+        limit=5,
+    )
+
+    assert payload["provenance"]["rerank"] == "applied"
+    assert payload["hits"][0]["node_id"] == b
+    assert beta_secret in payload["hits"][0]["snippet"]
+    assert rerankers
+    reranker = rerankers[0]
+    assert reranker.kwargs["base_url"] == "http://10.2.10.10:4000/v1/rerank"
+    assert reranker.kwargs["api_key_env"] == "OPENAI_API_KEY"
+    assert reranker.kwargs["model"] == "work-bifrost/vllm/qwen3-reranker-4b"
+    observed = reranker.calls[0]
+    assert observed["model"] == "work-bifrost/vllm/qwen3-reranker-4b"
+    assert query_secret not in observed["query"]
+    assert observed["query"].endswith("[LCM embedding privacy: name=api_key]")
+    assert all(
+        "[LCM embedding privacy: name=api_key]" in document
+        for document in observed["documents"]
+    )
+    assert all(
+        secret not in " ".join(observed["documents"])
+        for secret in (alpha_secret, beta_secret)
+    )
+
+
+def test_cohere_rerank_privacy_opt_out_keeps_raw_payload(recall_engine, monkeypatch):
+    _enable_cohere_rerank(recall_engine._config, monkeypatch)
+    recall_engine._config.embedding_privacy_enabled = False
+    snippet = "kanban raw api_key=snippet-secret-abcdefghijklmnop"
+    ordered = [_rerank_window_entry(snippet, "session-a")]
+    calls = []
+
+    class Capture(_FakeCohereReranker):
+        def rerank(self, query, documents, *, top_k=None, timeout, model):
+            calls.append((query, list(documents)))
+            return super().rerank(
+                query, documents, top_k=top_k, timeout=timeout, model=model
+            )
+
+    monkeypatch.setattr(lcm_tools, "CohereCompatibleReranker", Capture)
+    result, status, _scores = _call_rerank(recall_engine._config, ordered, provider=None)
+
+    assert status == "applied"
+    assert result[0]["hit"]["snippet"] == snippet
+    assert calls == [("kanban", [snippet])]
+
+
+def test_cohere_rerank_margin_holds_incumbent(recall_engine, monkeypatch):
+    _enable_cohere_rerank(recall_engine._config, monkeypatch)
+    recall_engine._config.rerank_margin = 0.3
+    ordered = [
+        _rerank_window_entry("incumbent", "session-c"),
+        _rerank_window_entry("challenger", "session-b"),
+        _rerank_window_entry("third", "session-a"),
+    ]
+
+    class MarginReranker:
+        def __init__(self, **kwargs):
+            pass
+
+        def rerank(self, query, documents, *, top_k=None, timeout, model):
+            return [(1, 0.8), (2, 0.7), (0, 0.6)]
+
+    monkeypatch.setattr(lcm_tools, "CohereCompatibleReranker", MarginReranker)
+    result, status, scores = _call_rerank(recall_engine._config, ordered)
+
+    assert status == "applied: rank1-held"
+    assert [entry["hit"]["session_id"] for entry in result] == [
+        "session-c",
+        "session-b",
+        "session-a",
+    ]
+    assert scores == [
+        [1, "session-b", 0.8],
+        [2, "session-a", 0.7],
+        [0, "session-c", 0.6],
+    ]
+
+
+def test_cohere_rerank_margin_overrides_when_gap_reaches_margin(recall_engine, monkeypatch):
+    _enable_cohere_rerank(recall_engine._config, monkeypatch)
+    recall_engine._config.rerank_margin = 0.3
+    ordered = [
+        _rerank_window_entry("incumbent", "session-a"),
+        _rerank_window_entry("challenger", "session-b"),
+    ]
+
+    class MarginReranker:
+        def __init__(self, **kwargs):
+            pass
+
+        def rerank(self, query, documents, *, top_k=None, timeout, model):
+            return [(1, 0.9), (0, 0.6)]
+
+    monkeypatch.setattr(lcm_tools, "CohereCompatibleReranker", MarginReranker)
+    result, status, _scores = _call_rerank(recall_engine._config, ordered)
+
+    assert status == "applied"
+    assert [entry["hit"]["session_id"] for entry in result] == ["session-b", "session-a"]
+
+
+def test_cohere_rerank_margin_partial_result_fails_open(recall_engine, monkeypatch):
+    _enable_cohere_rerank(recall_engine._config, monkeypatch)
+    recall_engine._config.rerank_margin = 0.3
+    ordered = [
+        _rerank_window_entry("incumbent", "session-a"),
+        _rerank_window_entry("challenger", "session-b"),
+    ]
+
+    class PartialReranker:
+        def __init__(self, **kwargs):
+            pass
+
+        def rerank(self, query, documents, *, top_k=None, timeout, model):
+            return [(1, 0.9)]
+
+    monkeypatch.setattr(lcm_tools, "CohereCompatibleReranker", PartialReranker)
+    result, status, scores = _call_rerank(recall_engine._config, ordered)
+
+    assert status == "skipped: partial rerank result"
+    assert result == ordered
+    assert scores == [[1, "session-b", 0.9]]
+
+
+def test_cohere_rerank_failure_keeps_incoming_order(recall_engine, monkeypatch):
+    _enable_cohere_rerank(recall_engine._config, monkeypatch)
+    ordered = [
+        _rerank_window_entry("kanban alpha", "session-a"),
+        _rerank_window_entry("kanban beta", "session-b"),
+    ]
+
+    class BrokenReranker:
+        def __init__(self, **kwargs):
+            pass
+
+        def rerank(self, *args, **kwargs):
+            raise RuntimeError("rerank endpoint down")
+
+    monkeypatch.setattr(lcm_tools, "CohereCompatibleReranker", BrokenReranker)
+    result, status, scores = _call_rerank(
+        recall_engine._config, ordered, provider=SimpleNamespace(provider_id="openai-compatible")
+    )
+
+    assert status == "skipped: rerank endpoint down"
+    assert result == ordered
+    assert scores == []
+
+
+def test_cohere_rerank_missing_model_base_url_and_key_skip(recall_engine, monkeypatch):
+    config = recall_engine._config
+    ordered = [_rerank_window_entry("kanban alpha", "session-a")]
+    _enable_cohere_rerank(config, monkeypatch, model="rerank-2.5-lite")
+    result, status, scores = _call_rerank(config, ordered)
+    assert result == ordered
+    assert status == "skipped: LCM_RERANK_MODEL is required for cohere-compatible"
+    assert scores == []
+
+    _enable_cohere_rerank(config, monkeypatch, model="")
+    result, status, _scores = _call_rerank(config, ordered)
+    assert status == "skipped: LCM_RERANK_MODEL is required for cohere-compatible"
+
+    _enable_cohere_rerank(config, monkeypatch, base_url="  ")
+    result, status, _scores = _call_rerank(config, ordered)
+    assert result == ordered
+    assert status == "skipped: LCM_RERANK_BASE_URL is required for cohere-compatible"
+
+    _enable_cohere_rerank(config, monkeypatch, key_env="OPENAI_API_KEY", key=None)
+    result, status, _scores = _call_rerank(config, ordered)
+    assert result == ordered
+    assert status == "skipped: OPENAI_API_KEY is not set"
+
+    config.rerank_api_key_env = ""
+    config.embedding_api_key_env = "LCM_EMBEDDING_API_KEY"
+    monkeypatch.delenv("LCM_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("LCM_RERANK_API_KEY", raising=False)
+    result, status, _scores = _call_rerank(config, ordered)
+    assert status == "skipped: LCM_RERANK_API_KEY is not set"
+
+    monkeypatch.setenv("LCM_RERANK_API_KEY", "rerank-only-key")
+    constructed = {}
+
+    class KeyEnvReranker(_FakeCohereReranker):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            constructed.update(kwargs)
+
+    monkeypatch.setattr(lcm_tools, "CohereCompatibleReranker", KeyEnvReranker)
+    _result, status, _scores = _call_rerank(config, ordered)
+    assert status == "applied"
+    assert constructed["api_key_env"] == "LCM_RERANK_API_KEY"
+
+    monkeypatch.delenv("LCM_RERANK_API_KEY", raising=False)
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "embed-key")
+    constructed.clear()
+    _result, status, _scores = _call_rerank(config, ordered)
+    assert status == "applied"
+    assert constructed["api_key_env"] == "LCM_EMBEDDING_API_KEY"
+
+
+def test_cohere_rerank_privacy_error_propagates(recall_engine, monkeypatch):
+    _enable_cohere_rerank(recall_engine._config, monkeypatch)
+    ordered = [_rerank_window_entry("kanban policy", "session-a")]
+
+    class QuietReranker:
+        def __init__(self, **kwargs):
+            pass
+
+        def rerank(self, query, documents, *, top_k=None, timeout, model):
+            raise AssertionError("rerank must not run after a privacy-policy error")
+
+    monkeypatch.setattr(lcm_tools, "CohereCompatibleReranker", QuietReranker)
+
+    def fail_dispatch(texts, config, *, expected_revision):
+        raise EmbeddingPrivacyPolicyError("policy changed before rerank dispatch")
+
+    monkeypatch.setattr(lcm_tools, "validate_embedding_privacy_dispatch", fail_dispatch)
+    with pytest.raises(
+        EmbeddingPrivacyPolicyError, match="policy changed before rerank dispatch"
+    ):
+        _call_rerank(recall_engine._config, ordered, provider=None)
+
+
+def test_cohere_rerank_reorders_fts_only_recall(recall_engine, monkeypatch):
+    """Embeddings off: FTS hits are still reranked by the cohere-compatible stage."""
+    recall_engine._config.embeddings_enabled = False
+    _enable_cohere_rerank(recall_engine._config, monkeypatch)
+    recall_engine._store.append(
+        "session-a", {"role": "user", "content": "kanban dashboard alpha marker"}
+    )
+    recall_engine._store.append(
+        "session-b", {"role": "user", "content": "kanban dashboard beta marker"}
+    )
+    captured = {}
+
+    class ReverseReranker:
+        def __init__(self, **kwargs):
+            pass
+
+        def rerank(self, query, documents, *, top_k=None, timeout, model):
+            captured["documents"] = list(documents)
+            return sorted(
+                ((index, float(index)) for index in range(len(documents))),
+                key=lambda item: -item[1],
+            )
+
+    monkeypatch.setattr(lcm_tools, "CohereCompatibleReranker", ReverseReranker)
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="kanban dashboard",
+        include="verbatim",
+        scope_bias=0.0,
+        limit=5,
+    )
+
+    assert payload["provenance"]["rerank"] == "applied"
+    documents = captured["documents"]
+    assert len(documents) >= 2
+    assert payload["hits"][0]["snippet"] == documents[-1]
+    assert payload["hits"][0]["snippet"] != documents[0]
+
+
 def test_limit_is_capped_and_reported(recall_engine, monkeypatch):
     recall_engine._store.append(CURRENT, {"role": "user", "content": "kanban dashboard sprint cap"})
     payload = _recall(recall_engine, monkeypatch, include="verbatim", limit=1000)
@@ -3024,6 +3436,42 @@ def test_rerank_margin_defaults_to_zero_and_reads_env(monkeypatch, tmp_path):
     assert LCMConfig(database_path=str(tmp_path / "default.db")).rerank_margin == 0.0
     monkeypatch.setenv("LCM_RERANK_MARGIN", "0.25")
     assert LCMConfig.from_env().rerank_margin == 0.25
+
+
+def test_rerank_provider_defaults_and_env_overrides(monkeypatch, caplog):
+    import logging as _logging
+
+    for key in ("LCM_RERANK_PROVIDER", "LCM_RERANK_BASE_URL", "LCM_RERANK_API_KEY_ENV"):
+        monkeypatch.delenv(key, raising=False)
+    fresh = LCMConfig()
+    assert fresh.rerank_provider == "voyage"
+    assert fresh.rerank_base_url == ""
+    assert fresh.rerank_api_key_env == ""
+    loaded = LCMConfig.from_env()
+    assert loaded.rerank_provider == "voyage"
+    assert loaded.rerank_base_url == ""
+    assert loaded.rerank_api_key_env == ""
+
+    monkeypatch.setenv("LCM_RERANK_PROVIDER", "  Cohere-Compatible ")
+    monkeypatch.setenv("LCM_RERANK_BASE_URL", "http://10.2.10.10:4000/v1/rerank")
+    monkeypatch.setenv("LCM_RERANK_API_KEY_ENV", "OPENAI_API_KEY")
+    overridden = LCMConfig.from_env()
+    assert overridden.rerank_provider == "cohere-compatible"
+    assert overridden.rerank_base_url == "http://10.2.10.10:4000/v1/rerank"
+    assert overridden.rerank_api_key_env == "OPENAI_API_KEY"
+
+    monkeypatch.setenv("LCM_RERANK_PROVIDER", "Voyage")
+    assert LCMConfig.from_env().rerank_provider == "voyage"
+
+    monkeypatch.setenv("LCM_RERANK_PROVIDER", "not-a-provider")
+    with caplog.at_level(_logging.WARNING, logger="hermes_lcm.config"):
+        warned = LCMConfig.from_env()
+    assert warned.rerank_provider == "voyage"
+    assert any(
+        "LCM_RERANK_PROVIDER" in record.getMessage()
+        and "not-a-provider" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_summary_source_expansion_refuses_an_expired_deadline(recall_engine):
